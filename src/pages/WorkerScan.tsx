@@ -4,12 +4,13 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { toast } from "sonner";
-import { LogOut, CheckCircle2 } from "lucide-react";
+import { LogOut, CheckCircle2, Camera, AlertCircle } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 const WorkerScan = () => {
-  const [scanning, setScanning] = useState(true);
+  const [scanning, setScanning] = useState(false);
   const [lastScan, setLastScan] = useState<string | null>(null);
+  const [cameraPermission, setCameraPermission] = useState<"pending" | "granted" | "denied">("pending");
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -28,14 +29,42 @@ const WorkerScan = () => {
     checkAuth();
   }, [navigate]);
 
+  // Request camera permission immediately
   useEffect(() => {
-    if (!scanning) return;
+    requestCameraPermission();
+  }, []);
 
-    // استخدام المحرك الأساسي لفتح الكاميرا الخلفية فوراً
+  const requestCameraPermission = async () => {
+    try {
+      // Try to get camera permission
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: "environment" } 
+      });
+      
+      // Permission granted
+      setCameraPermission("granted");
+      
+      // Stop the stream immediately (we just needed permission)
+      stream.getTracks().forEach(track => track.stop());
+      
+      // Start scanning automatically
+      setScanning(true);
+      
+      toast.success("تم السماح للكاميرا بنجاح!");
+    } catch (error) {
+      console.error("Camera permission error:", error);
+      setCameraPermission("denied");
+      toast.error("الرجاء السماح للكاميرا بالعمل من إعدادات المتصفح");
+    }
+  };
+
+  useEffect(() => {
+    if (!scanning || cameraPermission !== "granted") return;
+
     const html5QrCode = new Html5Qrcode("qr-reader");
 
     html5QrCode.start(
-      { facingMode: "environment" }, // إجبار المتصفح على الكاميرا الخلفية
+      { facingMode: "environment" },
       {
         fps: 10,
         qrbox: { width: 250, height: 250 },
@@ -43,11 +72,12 @@ const WorkerScan = () => {
       },
       onScanSuccess,
       (errorMessage) => {
-        // إخفاء أخطاء البحث المستمرة عن الـ QR
+        // Ignore continuous QR search errors
       }
     ).catch((err) => {
       console.error("Camera failed to start:", err);
-      toast.error("الرجاء السماح للكاميرا بالعمل في متصفحك.");
+      toast.error("فشل في تشغيل الكاميرا. الرجاء المحاولة مرة أخرى.");
+      setCameraPermission("denied");
     });
 
     return () => {
@@ -55,7 +85,7 @@ const WorkerScan = () => {
         html5QrCode.stop().catch(console.error);
       }
     };
-  }, [scanning]);
+  }, [scanning, cameraPermission]);
 
   const onScanSuccess = async (decodedText: string) => {
     setLastScan(decodedText);
@@ -65,10 +95,9 @@ const WorkerScan = () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      // إرسال البيانات بما فيها اسم الموظف إلى قاعدة البيانات
       const { error } = await supabase.from("attendance").insert({
         user_id: user.id,
-        user_name: user.user_metadata?.full_name || user.email, // <--- تم إضافة هذا السطر
+        user_name: user.user_metadata?.full_name || user.email,
         qr_data: decodedText,
         scanned_at: new Date().toISOString(),
       });
@@ -93,6 +122,11 @@ const WorkerScan = () => {
     setScanning(true);
   };
 
+  const handleRetryCamera = () => {
+    setCameraPermission("pending");
+    requestCameraPermission();
+  };
+
   return (
     <div className="min-h-screen bg-background p-4" dir="rtl">
       <div className="max-w-md mx-auto">
@@ -108,15 +142,46 @@ const WorkerScan = () => {
         </div>
 
         <Card className="p-6 mb-4 overflow-hidden">
-          {scanning ? (
+          {cameraPermission === "pending" && (
+            <div className="text-center py-8">
+              <Camera className="w-16 h-16 text-primary mx-auto mb-4 animate-pulse" />
+              <h3 className="text-lg font-semibold mb-2">جاري طلب إذن الكاميرا...</h3>
+              <p className="text-sm text-muted-foreground">
+                الرجاء السماح للكاميرا عند ظهور النافذة المنبثقة
+              </p>
+            </div>
+          )}
+
+          {cameraPermission === "denied" && (
+            <div className="text-center py-8">
+              <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+              <h3 className="text-lg font-semibold mb-2 text-red-600">تم رفض إذن الكاميرا</h3>
+              <p className="text-sm text-muted-foreground mb-4">
+                يرجى السماح للكاميرا من إعدادات المتصفح:
+              </p>
+              <ul className="text-xs text-right text-muted-foreground mb-4 space-y-1">
+                <li>• اذهب إلى إعدادات المتصفح</li>
+                <li>• ابحث عن "أذونات المواقع" أو "Site Settings"</li>
+                <li>• اسمح بالوصول للكاميرا لهذا الموقع</li>
+                <li>• أعد تحميل الصفحة</li>
+              </ul>
+              <Button onClick={handleRetryCamera} className="w-full">
+                <Camera className="w-4 h-4 ml-2" />
+                إعادة المحاولة
+              </Button>
+            </div>
+          )}
+
+          {cameraPermission === "granted" && scanning && (
             <div>
-              {/* هنا سيتم عرض الكاميرا */}
               <div id="qr-reader" className="w-full rounded-lg overflow-hidden"></div>
               <p className="text-center text-sm text-muted-foreground mt-4">
                 قم بتوجيه الكاميرا نحو رمز الاستجابة السريعة (QR)
               </p>
             </div>
-          ) : (
+          )}
+
+          {cameraPermission === "granted" && !scanning && lastScan && (
             <div className="text-center py-8">
               <CheckCircle2 className="w-16 h-16 text-green-500 mx-auto mb-4" />
               <h3 className="text-lg font-semibold mb-2">تم المسح بنجاح!</h3>
@@ -129,6 +194,18 @@ const WorkerScan = () => {
             </div>
           )}
         </Card>
+
+        {/* Camera permission instructions card */}
+        {cameraPermission === "denied" && (
+          <Card className="p-4 bg-amber-50 border-amber-200">
+            <h4 className="text-sm font-semibold text-amber-900 mb-2">
+              💡 نصيحة للهواتف القديمة:
+            </h4>
+            <p className="text-xs text-amber-800">
+              إذا لم تظهر نافذة طلب الإذن، قد تحتاج إلى السماح يدوياً من إعدادات المتصفح أو إعدادات النظام.
+            </p>
+          </Card>
+        )}
       </div>
     </div>
   );

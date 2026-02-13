@@ -12,16 +12,55 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { LogOut, RefreshCw, Download, LogIn, LogOut as LogOutIcon, Banknote, Users } from "lucide-react";
+import { 
+  LogOut, 
+  RefreshCw, 
+  Download, 
+  LogIn, 
+  LogOut as LogOutIcon, 
+  Banknote, 
+  Users,
+  Trash2,
+  Calendar,
+  Clock,
+  TrendingUp,
+  FileSpreadsheet,
+  DollarSign
+} from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import * as XLSX from "xlsx";
 import { toast } from "sonner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 interface Worker {
   user_id: string;
   user_name: string;
   email: string;
+}
+
+interface Advance {
+  id: string;
+  user_id: string;
+  user_name: string;
+  amount: number;
+  created_at: string;
+}
+
+interface AttendanceStats {
+  totalDays: number;
+  totalHours: number;
+  avgHoursPerDay: number;
+  daysPresent: number;
 }
 
 const Index = () => {
@@ -38,11 +77,27 @@ const Index = () => {
   // Advances management state
   const [selectedWorkerForAdvance, setSelectedWorkerForAdvance] = useState<string>("");
   const [advanceAmount, setAdvanceAmount] = useState<string>("");
-  const [advances, setAdvances] = useState<any[]>([]);
+  const [advances, setAdvances] = useState<Advance[]>([]);
+  const [filteredAdvances, setFilteredAdvances] = useState<Advance[]>([]);
+  const [selectedAdvanceWorker, setSelectedAdvanceWorker] = useState<string>("all");
 
   // Excel download worker selection
   const [selectedWorkerForExcel, setSelectedWorkerForExcel] = useState<string>("all");
   const [showExcelDialog, setShowExcelDialog] = useState(false);
+  
+  // Date range for Excel
+  const [startDate, setStartDate] = useState<string>("");
+  const [endDate, setEndDate] = useState<string>("");
+
+  // Delete advance dialog
+  const [advanceToDelete, setAdvanceToDelete] = useState<string | null>(null);
+
+  // Stats
+  const [workerStats, setWorkerStats] = useState<Record<string, AttendanceStats>>({});
+  const [totalAdvancesByWorker, setTotalAdvancesByWorker] = useState<Record<string, number>>({});
+
+  // Auto-refresh
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -61,6 +116,12 @@ const Index = () => {
     fetchScans();
     fetchWorkers();
     fetchAdvances();
+    
+    // Set default date range (last 30 days)
+    const today = new Date();
+    const thirtyDaysAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
+    setEndDate(today.toISOString().split('T')[0]);
+    setStartDate(thirtyDaysAgo.toISOString().split('T')[0]);
   }, [navigate]);
 
   useEffect(() => {
@@ -71,6 +132,43 @@ const Index = () => {
       setFilteredScans(scans.filter(scan => scan.user_id === selectedWorker));
     }
   }, [selectedWorker, scans]);
+
+  useEffect(() => {
+    // Filter advances based on selected worker
+    if (selectedAdvanceWorker === "all") {
+      setFilteredAdvances(advances);
+    } else {
+      setFilteredAdvances(advances.filter(adv => adv.user_id === selectedAdvanceWorker));
+    }
+  }, [selectedAdvanceWorker, advances]);
+
+  useEffect(() => {
+    // Calculate total advances per worker
+    const totals: Record<string, number> = {};
+    advances.forEach(advance => {
+      if (!totals[advance.user_id]) {
+        totals[advance.user_id] = 0;
+      }
+      totals[advance.user_id] += advance.amount;
+    });
+    setTotalAdvancesByWorker(totals);
+  }, [advances]);
+
+  useEffect(() => {
+    // Auto-refresh every 30 seconds
+    if (!autoRefresh) return;
+    
+    const interval = setInterval(() => {
+      fetchScans();
+      fetchAdvances();
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, [autoRefresh]);
+
+  useEffect(() => {
+    calculateWorkerStats();
+  }, [scans]);
 
   const generateNewToken = (type: "حضور" | "انصراف") => {
     setScanType(type);
@@ -83,7 +181,7 @@ const Index = () => {
       .from("attendance")
       .select("*")
       .order("scanned_at", { ascending: false })
-      .limit(50);
+      .limit(100);
       
     if (error) {
       console.error("Error fetching scans:", error);
@@ -94,7 +192,6 @@ const Index = () => {
 
   const fetchWorkers = async () => {
     try {
-      // Get ALL users with worker role from user_roles and auth.users
       const { data, error } = await supabase
         .from("user_roles")
         .select("user_id")
@@ -102,19 +199,17 @@ const Index = () => {
 
       if (error) {
         console.error("Error fetching workers from user_roles:", error);
-        toast.error("حدث خطأ في تحميل قائمة الموظفين");
+        await fetchWorkersFromAttendance();
         return;
       }
 
       if (data && data.length > 0) {
-        // Get user details from auth.users
         const userIds = data.map(item => item.user_id);
         
         const { data: usersData, error: usersError } = await supabase.auth.admin.listUsers();
         
         if (usersError) {
           console.error("Error fetching user details:", usersError);
-          // Fallback: try to get from attendance table
           await fetchWorkersFromAttendance();
           return;
         }
@@ -127,18 +222,14 @@ const Index = () => {
             email: user.email || ""
           }));
 
-        // Sort by name
         workersList.sort((a, b) => a.user_name.localeCompare(b.user_name, 'ar'));
-        
         setWorkers(workersList);
         console.log("Workers loaded from user_roles:", workersList.length);
       } else {
-        console.log("No workers found in user_roles table");
         setWorkers([]);
       }
     } catch (err) {
       console.error("Exception in fetchWorkers:", err);
-      // Fallback to attendance table method
       await fetchWorkersFromAttendance();
     }
   };
@@ -169,7 +260,6 @@ const Index = () => {
         
         uniqueWorkers.sort((a, b) => a.user_name.localeCompare(b.user_name, 'ar'));
         setWorkers(uniqueWorkers as Worker[]);
-        console.log("Workers loaded from attendance (fallback):", uniqueWorkers.length);
       }
     } catch (err) {
       console.error("Exception in fetchWorkersFromAttendance:", err);
@@ -187,6 +277,59 @@ const Index = () => {
       return;
     }
     if (data) setAdvances(data);
+  };
+
+  const calculateWorkerStats = () => {
+    const stats: Record<string, AttendanceStats> = {};
+
+    scans.forEach(scan => {
+      if (!stats[scan.user_id]) {
+        stats[scan.user_id] = {
+          totalDays: 0,
+          totalHours: 0,
+          avgHoursPerDay: 0,
+          daysPresent: 0
+        };
+      }
+    });
+
+    // Group by date
+    const scansByDate: Record<string, any[]> = {};
+    scans.forEach(scan => {
+      const dateKey = new Date(scan.scanned_at).toLocaleDateString('en-CA');
+      const groupKey = `${scan.user_id}_${dateKey}`;
+      if (!scansByDate[groupKey]) {
+        scansByDate[groupKey] = [];
+      }
+      scansByDate[groupKey].push(scan);
+    });
+
+    // Calculate hours
+    Object.entries(scansByDate).forEach(([key, dayScans]) => {
+      const userId = key.split('_')[0];
+      const checkIns = dayScans.filter(s => s.qr_data.includes("حضور"));
+      const checkOuts = dayScans.filter(s => s.qr_data.includes("انصراف"));
+
+      if (checkIns.length > 0 && checkOuts.length > 0) {
+        const firstCheckIn = new Date(checkIns[0].scanned_at);
+        const lastCheckOut = new Date(checkOuts[checkOuts.length - 1].scanned_at);
+        const hours = (lastCheckOut.getTime() - firstCheckIn.getTime()) / (1000 * 60 * 60);
+        
+        if (hours > 0) {
+          stats[userId].totalHours += hours;
+          stats[userId].daysPresent += 1;
+        }
+      }
+    });
+
+    // Calculate averages
+    Object.keys(stats).forEach(userId => {
+      if (stats[userId].daysPresent > 0) {
+        stats[userId].avgHoursPerDay = stats[userId].totalHours / stats[userId].daysPresent;
+      }
+    });
+
+    setWorkerStats(stats);
   };
 
   const handleSaveAdvance = async () => {
@@ -225,6 +368,25 @@ const Index = () => {
     fetchAdvances();
   };
 
+  const handleDeleteAdvance = async () => {
+    if (!advanceToDelete) return;
+
+    const { error } = await supabase
+      .from("advances")
+      .delete()
+      .eq("id", advanceToDelete);
+
+    if (error) {
+      toast.error("حدث خطأ أثناء حذف السلفة");
+      console.error(error);
+      return;
+    }
+
+    toast.success("تم حذف السلفة بنجاح");
+    setAdvanceToDelete(null);
+    fetchAdvances();
+  };
+
   const handleDownloadExcel = () => {
     setShowExcelDialog(true);
   };
@@ -232,15 +394,23 @@ const Index = () => {
   const downloadExcel = async () => {
     const workerIdToDownload = selectedWorkerForExcel;
     
-    // جلب كافة البيانات من الأقدم للأحدث لتسهيل الحساب
     let query = supabase
       .from("attendance")
       .select("*")
       .order("scanned_at", { ascending: true });
 
-    // Apply worker filter if selected
     if (workerIdToDownload !== "all") {
       query = query.eq("user_id", workerIdToDownload);
+    }
+
+    // Apply date filter
+    if (startDate) {
+      query = query.gte("scanned_at", new Date(startDate).toISOString());
+    }
+    if (endDate) {
+      const endDateTime = new Date(endDate);
+      endDateTime.setHours(23, 59, 59);
+      query = query.lte("scanned_at", endDateTime.toISOString());
     }
 
     const { data, error } = await query;
@@ -250,7 +420,6 @@ const Index = () => {
       return;
     }
 
-    // Get advances for the selected worker(s)
     let advancesQuery = supabase
       .from("advances")
       .select("*")
@@ -260,9 +429,17 @@ const Index = () => {
       advancesQuery = advancesQuery.eq("user_id", workerIdToDownload);
     }
 
+    if (startDate) {
+      advancesQuery = advancesQuery.gte("created_at", new Date(startDate).toISOString());
+    }
+    if (endDate) {
+      const endDateTime = new Date(endDate);
+      endDateTime.setHours(23, 59, 59);
+      advancesQuery = advancesQuery.lte("created_at", endDateTime.toISOString());
+    }
+
     const { data: advancesData } = await advancesQuery;
 
-    // تجميع البيانات حسب الموظف والتاريخ
     const recordsByUserAndDate: Record<string, any> = {};
 
     data.forEach((scan) => {
@@ -291,7 +468,6 @@ const Index = () => {
       }
     });
 
-    // تحويل البيانات المجمعة إلى الشكل النهائي للإكسيل
     const excelData = Object.values(recordsByUserAndDate).map((record) => {
       const checkInStr = record.checkIn ? record.checkIn.toLocaleTimeString('ar-EG') : "لم يسجل";
       const checkOutStr = record.checkOut ? record.checkOut.toLocaleTimeString('ar-EG') : "لم يسجل";
@@ -313,19 +489,30 @@ const Index = () => {
       };
     });
 
-    // ترتيب السجلات في ملف الإكسيل حسب التاريخ (الأحدث أولاً)
     excelData.reverse();
 
-    // Create workbook
+    // Calculate totals
+    const totalHours = excelData.reduce((sum, row) => {
+      return sum + parseFloat(row["ساعات العمل"] || "0");
+    }, 0);
+
+    // Add summary row
+    excelData.push({
+      "اسم الموظف": "الإجمالي",
+      "التاريخ": "",
+      "اليوم": "",
+      "وقت الحضور": "",
+      "وقت الانصراف": "",
+      "ساعات العمل": totalHours.toFixed(2),
+    });
+
     const workbook = XLSX.utils.book_new();
     
-    // Add attendance sheet
     const attendanceSheet = XLSX.utils.json_to_sheet(excelData);
     if (!attendanceSheet['!views']) attendanceSheet['!views'] = [];
     attendanceSheet['!views'].push({ rightToLeft: true });
     XLSX.utils.book_append_sheet(workbook, attendanceSheet, "تقرير الحضور");
 
-    // Add advances sheet if there are any
     if (advancesData && advancesData.length > 0) {
       const advancesExcelData = advancesData.map(advance => ({
         "اسم الموظف": advance.user_name,
@@ -334,7 +521,6 @@ const Index = () => {
         "الوقت": new Date(advance.created_at).toLocaleTimeString('ar-EG'),
       }));
 
-      // Calculate total advances
       const totalAdvances = advancesData.reduce((sum, adv) => sum + adv.amount, 0);
       advancesExcelData.push({
         "اسم الموظف": "المجموع الكلي",
@@ -348,18 +534,57 @@ const Index = () => {
       advancesSheet['!views'].push({ rightToLeft: true });
       XLSX.utils.book_append_sheet(workbook, advancesSheet, "السلف");
     }
+
+    // Add summary sheet
+    const summaryData = [];
+    if (workerIdToDownload === "all") {
+      workers.forEach(worker => {
+        const workerHours = workerStats[worker.user_id]?.totalHours || 0;
+        const workerDays = workerStats[worker.user_id]?.daysPresent || 0;
+        const workerAvg = workerStats[worker.user_id]?.avgHoursPerDay || 0;
+        const workerAdvances = totalAdvancesByWorker[worker.user_id] || 0;
+
+        summaryData.push({
+          "الموظف": worker.user_name,
+          "إجمالي الساعات": workerHours.toFixed(2),
+          "عدد الأيام": workerDays,
+          "متوسط الساعات/يوم": workerAvg.toFixed(2),
+          "إجمالي السلف (جنيه)": workerAdvances.toFixed(2),
+        });
+      });
+    } else {
+      const worker = workers.find(w => w.user_id === workerIdToDownload);
+      if (worker) {
+        summaryData.push({
+          "الموظف": worker.user_name,
+          "إجمالي الساعات": (workerStats[worker.user_id]?.totalHours || 0).toFixed(2),
+          "عدد الأيام": workerStats[worker.user_id]?.daysPresent || 0,
+          "متوسط الساعات/يوم": (workerStats[worker.user_id]?.avgHoursPerDay || 0).toFixed(2),
+          "إجمالي السلف (جنيه)": (totalAdvancesByWorker[worker.user_id] || 0).toFixed(2),
+        });
+      }
+    }
+
+    if (summaryData.length > 0) {
+      const summarySheet = XLSX.utils.json_to_sheet(summaryData);
+      if (!summarySheet['!views']) summarySheet['!views'] = [];
+      summarySheet['!views'].push({ rightToLeft: true });
+      XLSX.utils.book_append_sheet(workbook, summarySheet, "الملخص");
+    }
     
-    // Generate filename based on filter
     const workerName = workerIdToDownload === "all" 
       ? "جميع_الموظفين"
       : workers.find(w => w.user_id === workerIdToDownload)?.user_name || "موظف";
     
-    const fileName = `تقرير_${workerName}_${new Date().toLocaleDateString('en-CA')}.xlsx`;
+    const dateRange = startDate && endDate 
+      ? `_${startDate}_الى_${endDate}`
+      : `_${new Date().toLocaleDateString('en-CA')}`;
+    
+    const fileName = `تقرير_${workerName}${dateRange}.xlsx`;
     
     XLSX.writeFile(workbook, fileName);
     toast.success("تم تحميل التقرير بنجاح!");
     setShowExcelDialog(false);
-    setSelectedWorkerForExcel("all");
   };
 
   const handleLogout = async () => {
@@ -377,6 +602,14 @@ const Index = () => {
             <p className="text-muted-foreground mt-1">إنشاء رموز QR ومتابعة سجلات الموظفين</p>
           </div>
           <div className="flex gap-4">
+            <Button 
+              variant={autoRefresh ? "default" : "outline"} 
+              size="icon"
+              onClick={() => setAutoRefresh(!autoRefresh)}
+              title={autoRefresh ? "إيقاف التحديث التلقائي" : "تفعيل التحديث التلقائي"}
+            >
+              <RefreshCw className={`w-4 h-4 ${autoRefresh ? 'animate-spin' : ''}`} />
+            </Button>
             <Button variant="outline" onClick={handleDownloadExcel} className="bg-green-50 text-green-700 hover:bg-green-100 border-green-200">
               <Download className="w-4 h-4 ml-2" />
               تصدير التقرير مفصل
@@ -388,29 +621,103 @@ const Index = () => {
           </div>
         </div>
 
+        {/* Stats Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+          <Card className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">عدد الموظفين</p>
+                <p className="text-2xl font-bold">{workers.length}</p>
+              </div>
+              <Users className="w-8 h-8 text-primary" />
+            </div>
+          </Card>
+          <Card className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">سجلات اليوم</p>
+                <p className="text-2xl font-bold">
+                  {scans.filter(s => {
+                    const today = new Date().toLocaleDateString('en-CA');
+                    return new Date(s.scanned_at).toLocaleDateString('en-CA') === today;
+                  }).length}
+                </p>
+              </div>
+              <Clock className="w-8 h-8 text-blue-500" />
+            </div>
+          </Card>
+          <Card className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">إجمالي السلف</p>
+                <p className="text-2xl font-bold">
+                  {advances.reduce((sum, adv) => sum + adv.amount, 0).toFixed(0)} جنيه
+                </p>
+              </div>
+              <DollarSign className="w-8 h-8 text-green-500" />
+            </div>
+          </Card>
+          <Card className="p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">آخر تحديث</p>
+                <p className="text-sm font-medium">
+                  {new Date().toLocaleTimeString('ar-EG')}
+                </p>
+              </div>
+              <TrendingUp className="w-8 h-8 text-purple-500" />
+            </div>
+          </Card>
+        </div>
+
         {/* Excel Download Dialog */}
         {showExcelDialog && (
           <Card className="p-6 mb-8 border-2 border-primary">
-            <h3 className="text-lg font-semibold mb-4">اختر الموظف لتصدير التقرير</h3>
+            <h3 className="text-lg font-semibold mb-4 flex items-center">
+              <FileSpreadsheet className="w-5 h-5 ml-2" />
+              إعدادات تصدير التقرير
+            </h3>
             <div className="space-y-4">
-              <div>
-                <Label htmlFor="excel-worker-select">اختيار الموظف</Label>
-                <Select 
-                  value={selectedWorkerForExcel} 
-                  onValueChange={setSelectedWorkerForExcel}
-                >
-                  <SelectTrigger id="excel-worker-select" className="mt-2">
-                    <SelectValue placeholder="اختر موظفاً" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">جميع الموظفين</SelectItem>
-                    {workers.map((worker) => (
-                      <SelectItem key={worker.user_id} value={worker.user_id}>
-                        {worker.user_name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <Label htmlFor="excel-worker-select">اختيار الموظف</Label>
+                  <Select 
+                    value={selectedWorkerForExcel} 
+                    onValueChange={setSelectedWorkerForExcel}
+                  >
+                    <SelectTrigger id="excel-worker-select" className="mt-2">
+                      <SelectValue placeholder="اختر موظفاً" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">جميع الموظفين</SelectItem>
+                      {workers.map((worker) => (
+                        <SelectItem key={worker.user_id} value={worker.user_id}>
+                          {worker.user_name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label htmlFor="start-date">من تاريخ</Label>
+                  <Input
+                    id="start-date"
+                    type="date"
+                    value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    className="mt-2"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="end-date">إلى تاريخ</Label>
+                  <Input
+                    id="end-date"
+                    type="date"
+                    value={endDate}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    className="mt-2"
+                  />
+                </div>
               </div>
               <div className="flex gap-3">
                 <Button onClick={downloadExcel} className="flex-1">
@@ -421,9 +728,16 @@ const Index = () => {
                   إلغاء
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">
-                💡 سيتم تضمين سجلات الحضور والسلف للموظف المختار
-              </p>
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                <p className="text-xs text-blue-800">
+                  <strong>💡 سيتضمن التقرير 3 أوراق:</strong>
+                </p>
+                <ul className="text-xs text-blue-700 mt-2 mr-4 space-y-1">
+                  <li>• تقرير الحضور والانصراف مع إجمالي الساعات</li>
+                  <li>• سجل السلف مع المجموع الكلي</li>
+                  <li>• ملخص إحصائي شامل</li>
+                </ul>
+              </div>
             </div>
           </Card>
         )}
@@ -482,13 +796,12 @@ const Index = () => {
 
               <Card className="p-6">
                 <div className="flex justify-between items-center mb-6">
-                  <h2 className="text-xl font-semibold">أحدث السجلات (مباشر)</h2>
+                  <h2 className="text-xl font-semibold">أحدث السجلات</h2>
                   <Button variant="ghost" size="icon" onClick={fetchScans} title="تحديث">
                     <RefreshCw className="w-4 h-4" />
                   </Button>
                 </div>
 
-                {/* Worker Filter Dropdown */}
                 <div className="mb-4">
                   <Label htmlFor="worker-filter" className="mb-2 block">
                     <Users className="w-4 h-4 inline ml-2" />
@@ -499,23 +812,17 @@ const Index = () => {
                       <SelectValue placeholder="اختر موظفاً" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="all">جميع الموظفين</SelectItem>
-                      {workers.length === 0 ? (
-                        <SelectItem value="none" disabled>لا يوجد موظفين</SelectItem>
-                      ) : (
-                        workers.map((worker) => (
+                      <SelectItem value="all">جميع الموظفين ({scans.length})</SelectItem>
+                      {workers.map((worker) => {
+                        const workerScansCount = scans.filter(s => s.user_id === worker.user_id).length;
+                        return (
                           <SelectItem key={worker.user_id} value={worker.user_id}>
-                            {worker.user_name}
+                            {worker.user_name} ({workerScansCount})
                           </SelectItem>
-                        ))
-                      )}
+                        );
+                      })}
                     </SelectContent>
                   </Select>
-                  {workers.length > 0 && (
-                    <p className="text-xs text-muted-foreground mt-1">
-                      عدد الموظفين: {workers.length}
-                    </p>
-                  )}
                 </div>
                 
                 <div className="space-y-4 overflow-y-auto max-h-[400px] pr-2">
@@ -523,14 +830,15 @@ const Index = () => {
                     <p className="text-center text-muted-foreground py-8">لا توجد سجلات بعد...</p>
                   ) : (
                     filteredScans.map((scan) => (
-                      <div key={scan.id} className="flex flex-col p-3 border rounded-lg bg-card">
+                      <div key={scan.id} className="flex flex-col p-3 border rounded-lg bg-card hover:bg-accent transition-colors">
                         <div className="flex justify-between items-start mb-2">
                           <span className={`text-sm font-bold ${scan.qr_data.includes("حضور") ? "text-primary" : "text-red-500"}`}>
-                            {scan.qr_data.includes("حضور") ? "تسجيل حضور" : "تسجيل انصراف"}
+                            {scan.qr_data.includes("حضور") ? "✓ تسجيل حضور" : "✗ تسجيل انصراف"}
                           </span>
-                          <span className="text-xs text-muted-foreground" dir="ltr">
-                            {new Date(scan.scanned_at).toLocaleTimeString('ar-EG')}
-                          </span>
+                          <div className="text-xs text-muted-foreground">
+                            <div dir="ltr">{new Date(scan.scanned_at).toLocaleTimeString('ar-EG')}</div>
+                            <div className="text-right">{new Date(scan.scanned_at).toLocaleDateString('ar-EG')}</div>
+                          </div>
                         </div>
                         <span className="text-sm font-medium mt-1">
                           الموظف: {scan.user_name || scan.user_id}
@@ -545,7 +853,6 @@ const Index = () => {
 
           <TabsContent value="advances">
             <div className="grid md:grid-cols-2 gap-8">
-              {/* Advances Form */}
               <Card className="p-6">
                 <h2 className="text-xl font-semibold mb-6 flex items-center">
                   <Banknote className="w-5 h-5 ml-2" />
@@ -566,19 +873,17 @@ const Index = () => {
                         {workers.length === 0 ? (
                           <SelectItem value="none" disabled>لا يوجد موظفين</SelectItem>
                         ) : (
-                          workers.map((worker) => (
-                            <SelectItem key={worker.user_id} value={worker.user_id}>
-                              {worker.user_name}
-                            </SelectItem>
-                          ))
+                          workers.map((worker) => {
+                            const totalAdvances = totalAdvancesByWorker[worker.user_id] || 0;
+                            return (
+                              <SelectItem key={worker.user_id} value={worker.user_id}>
+                                {worker.user_name} {totalAdvances > 0 ? `(${totalAdvances.toFixed(0)} جنيه)` : ''}
+                              </SelectItem>
+                            );
+                          })
                         )}
                       </SelectContent>
                     </Select>
-                    {workers.length === 0 && (
-                      <p className="text-xs text-amber-600 mt-2">
-                        تنبيه: لا يوجد موظفين في قاعدة البيانات. يرجى التأكد من وجود سجلات في جدول user_roles
-                      </p>
-                    )}
                   </div>
 
                   <div>
@@ -606,37 +911,77 @@ const Index = () => {
                 </div>
               </Card>
 
-              {/* Advances History */}
               <Card className="p-6">
-                <div className="flex justify-between items-center mb-6">
+                <div className="flex justify-between items-center mb-4">
                   <h2 className="text-xl font-semibold">سجل السلف</h2>
                   <Button variant="ghost" size="icon" onClick={fetchAdvances} title="تحديث">
                     <RefreshCw className="w-4 h-4" />
                   </Button>
                 </div>
 
+                <div className="mb-4">
+                  <Select value={selectedAdvanceWorker} onValueChange={setSelectedAdvanceWorker}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="تصفية حسب الموظف" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">جميع الموظفين ({advances.length})</SelectItem>
+                      {workers.map((worker) => {
+                        const workerAdvances = advances.filter(a => a.user_id === worker.user_id);
+                        return workerAdvances.length > 0 ? (
+                          <SelectItem key={worker.user_id} value={worker.user_id}>
+                            {worker.user_name} ({workerAdvances.length})
+                          </SelectItem>
+                        ) : null;
+                      })}
+                    </SelectContent>
+                  </Select>
+                </div>
+
                 <div className="space-y-4 overflow-y-auto max-h-[400px] pr-2">
-                  {advances.length === 0 ? (
+                  {filteredAdvances.length === 0 ? (
                     <p className="text-center text-muted-foreground py-8">لا توجد سلف مسجلة بعد...</p>
                   ) : (
-                    advances.map((advance) => (
-                      <div key={advance.id} className="flex flex-col p-4 border rounded-lg bg-card">
-                        <div className="flex justify-between items-start mb-2">
-                          <span className="text-sm font-bold text-primary">
-                            {advance.user_name}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            {new Date(advance.created_at).toLocaleDateString('ar-EG')}
-                          </span>
+                    <>
+                      {filteredAdvances.map((advance) => (
+                        <div key={advance.id} className="flex items-center justify-between p-4 border rounded-lg bg-card hover:bg-accent transition-colors group">
+                          <div className="flex-1">
+                            <div className="flex justify-between items-start mb-2">
+                              <span className="text-sm font-bold text-primary">
+                                {advance.user_name}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {new Date(advance.created_at).toLocaleDateString('ar-EG')}
+                              </span>
+                            </div>
+                            <span className="text-lg font-semibold text-green-600">
+                              {advance.amount.toFixed(2)} جنيه
+                            </span>
+                            <div className="text-xs text-muted-foreground mt-1">
+                              {new Date(advance.created_at).toLocaleTimeString('ar-EG')}
+                            </div>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setAdvanceToDelete(advance.id)}
+                            className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-700"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
                         </div>
-                        <span className="text-lg font-semibold text-green-600">
-                          {advance.amount.toFixed(2)} جنيه
-                        </span>
-                        <span className="text-xs text-muted-foreground mt-1">
-                          {new Date(advance.created_at).toLocaleTimeString('ar-EG')}
-                        </span>
-                      </div>
-                    ))
+                      ))}
+                      {filteredAdvances.length > 0 && (
+                        <div className="p-4 border-2 border-primary rounded-lg bg-primary/5">
+                          <div className="flex justify-between items-center">
+                            <span className="font-semibold">المجموع الكلي:</span>
+                            <span className="text-xl font-bold text-primary">
+                              {filteredAdvances.reduce((sum, adv) => sum + adv.amount, 0).toFixed(2)} جنيه
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </Card>
@@ -645,6 +990,24 @@ const Index = () => {
         </Tabs>
 
       </div>
+
+      {/* Delete Advance Dialog */}
+      <AlertDialog open={!!advanceToDelete} onOpenChange={() => setAdvanceToDelete(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>تأكيد حذف السلفة</AlertDialogTitle>
+            <AlertDialogDescription>
+              هل أنت متأكد من حذف هذه السلفة؟ لا يمكن التراجع عن هذا الإجراء.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>إلغاء</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteAdvance} className="bg-red-500 hover:bg-red-600">
+              حذف
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 };

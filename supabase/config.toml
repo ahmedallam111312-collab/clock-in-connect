@@ -1,0 +1,7 @@
+project_id = "uypicoryafomuhkrptdi"
+
+[functions.generate-qr-token]
+verify_jwt = false
+
+[functions.validate-scan]
+verify_jwt = false

@@ -21,6 +21,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 interface Worker {
   user_id: string;
   user_name: string;
+  email: string;
 }
 
 const Index = () => {
@@ -38,6 +39,10 @@ const Index = () => {
   const [selectedWorkerForAdvance, setSelectedWorkerForAdvance] = useState<string>("");
   const [advanceAmount, setAdvanceAmount] = useState<string>("");
   const [advances, setAdvances] = useState<any[]>([]);
+
+  // Excel download worker selection
+  const [selectedWorkerForExcel, setSelectedWorkerForExcel] = useState<string>("all");
+  const [showExcelDialog, setShowExcelDialog] = useState(false);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -89,39 +94,85 @@ const Index = () => {
 
   const fetchWorkers = async () => {
     try {
-      // Get unique workers from attendance table
+      // Get ALL users with worker role from user_roles and auth.users
       const { data, error } = await supabase
-        .from("attendance")
-        .select("user_id, user_name");
+        .from("user_roles")
+        .select("user_id")
+        .eq("role", "worker");
 
       if (error) {
-        console.error("Error fetching workers:", error);
+        console.error("Error fetching workers from user_roles:", error);
         toast.error("حدث خطأ في تحميل قائمة الموظفين");
         return;
       }
 
       if (data && data.length > 0) {
-        // Remove duplicates and filter out entries without user_name
-        const uniqueWorkers = Array.from(
-          new Map(
-            data
-              .filter(item => item.user_name && item.user_name.trim() !== "")
-              .map(item => [item.user_id, item])
-          ).values()
-        );
+        // Get user details from auth.users
+        const userIds = data.map(item => item.user_id);
         
+        const { data: usersData, error: usersError } = await supabase.auth.admin.listUsers();
+        
+        if (usersError) {
+          console.error("Error fetching user details:", usersError);
+          // Fallback: try to get from attendance table
+          await fetchWorkersFromAttendance();
+          return;
+        }
+
+        const workersList: Worker[] = usersData.users
+          .filter(user => userIds.includes(user.id))
+          .map(user => ({
+            user_id: user.id,
+            user_name: user.user_metadata?.full_name || user.email?.split('@')[0] || user.email || "موظف",
+            email: user.email || ""
+          }));
+
         // Sort by name
-        uniqueWorkers.sort((a, b) => a.user_name.localeCompare(b.user_name, 'ar'));
+        workersList.sort((a, b) => a.user_name.localeCompare(b.user_name, 'ar'));
         
-        setWorkers(uniqueWorkers as Worker[]);
-        console.log("Workers loaded:", uniqueWorkers.length);
+        setWorkers(workersList);
+        console.log("Workers loaded from user_roles:", workersList.length);
       } else {
-        console.log("No workers found in attendance table");
+        console.log("No workers found in user_roles table");
         setWorkers([]);
       }
     } catch (err) {
       console.error("Exception in fetchWorkers:", err);
-      toast.error("حدث خطأ غير متوقع");
+      // Fallback to attendance table method
+      await fetchWorkersFromAttendance();
+    }
+  };
+
+  const fetchWorkersFromAttendance = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("attendance")
+        .select("user_id, user_name");
+
+      if (error) {
+        console.error("Error fetching workers from attendance:", error);
+        return;
+      }
+
+      if (data && data.length > 0) {
+        const uniqueWorkers = Array.from(
+          new Map(
+            data
+              .filter(item => item.user_name && item.user_name.trim() !== "")
+              .map(item => [item.user_id, { 
+                user_id: item.user_id, 
+                user_name: item.user_name,
+                email: ""
+              }])
+          ).values()
+        );
+        
+        uniqueWorkers.sort((a, b) => a.user_name.localeCompare(b.user_name, 'ar'));
+        setWorkers(uniqueWorkers as Worker[]);
+        console.log("Workers loaded from attendance (fallback):", uniqueWorkers.length);
+      }
+    } catch (err) {
+      console.error("Exception in fetchWorkersFromAttendance:", err);
     }
   };
 
@@ -174,7 +225,13 @@ const Index = () => {
     fetchAdvances();
   };
 
+  const handleDownloadExcel = () => {
+    setShowExcelDialog(true);
+  };
+
   const downloadExcel = async () => {
+    const workerIdToDownload = selectedWorkerForExcel;
+    
     // جلب كافة البيانات من الأقدم للأحدث لتسهيل الحساب
     let query = supabase
       .from("attendance")
@@ -182,8 +239,8 @@ const Index = () => {
       .order("scanned_at", { ascending: true });
 
     // Apply worker filter if selected
-    if (selectedWorker !== "all") {
-      query = query.eq("user_id", selectedWorker);
+    if (workerIdToDownload !== "all") {
+      query = query.eq("user_id", workerIdToDownload);
     }
 
     const { data, error } = await query;
@@ -193,17 +250,29 @@ const Index = () => {
       return;
     }
 
+    // Get advances for the selected worker(s)
+    let advancesQuery = supabase
+      .from("advances")
+      .select("*")
+      .order("created_at", { ascending: true });
+    
+    if (workerIdToDownload !== "all") {
+      advancesQuery = advancesQuery.eq("user_id", workerIdToDownload);
+    }
+
+    const { data: advancesData } = await advancesQuery;
+
     // تجميع البيانات حسب الموظف والتاريخ
     const recordsByUserAndDate: Record<string, any> = {};
 
     data.forEach((scan) => {
       const dateObj = new Date(scan.scanned_at);
-      // استخراج التاريخ فقط (بدون الوقت) كمفتاح للتجميع
       const dateKey = dateObj.toLocaleDateString('en-CA'); 
       const groupKey = `${scan.user_id}_${dateKey}`;
 
       if (!recordsByUserAndDate[groupKey]) {
         recordsByUserAndDate[groupKey] = {
+          userId: scan.user_id,
           name: scan.user_name || scan.user_id,
           dateObj: dateObj,
           checkIn: null,
@@ -211,14 +280,11 @@ const Index = () => {
         };
       }
 
-      // تحديد وقت الحضور والانصراف
       if (scan.qr_data.includes("حضور")) {
-        // حفظ أول تسجيل حضور في اليوم
         if (!recordsByUserAndDate[groupKey].checkIn || dateObj < recordsByUserAndDate[groupKey].checkIn) {
           recordsByUserAndDate[groupKey].checkIn = dateObj;
         }
       } else if (scan.qr_data.includes("انصراف")) {
-        // حفظ آخر تسجيل انصراف في اليوم
         if (!recordsByUserAndDate[groupKey].checkOut || dateObj > recordsByUserAndDate[groupKey].checkOut) {
           recordsByUserAndDate[groupKey].checkOut = dateObj;
         }
@@ -231,11 +297,9 @@ const Index = () => {
       const checkOutStr = record.checkOut ? record.checkOut.toLocaleTimeString('ar-EG') : "لم يسجل";
       
       let hoursWorked = "0.00";
-      // حساب الساعات إذا كان هناك حضور وانصراف
       if (record.checkIn && record.checkOut) {
         const diffMs = record.checkOut.getTime() - record.checkIn.getTime();
         const diffHrs = diffMs / (1000 * 60 * 60);
-        // تجنب الساعات السالبة إذا حدث خطأ في المسح
         hoursWorked = diffHrs > 0 ? diffHrs.toFixed(2) : "0.00"; 
       }
 
@@ -252,22 +316,50 @@ const Index = () => {
     // ترتيب السجلات في ملف الإكسيل حسب التاريخ (الأحدث أولاً)
     excelData.reverse();
 
-    const worksheet = XLSX.utils.json_to_sheet(excelData);
+    // Create workbook
     const workbook = XLSX.utils.book_new();
     
-    // ضبط اتجاه الشيت ليكون من اليمين لليسار
-    if (!worksheet['!views']) worksheet['!views'] = [];
-    worksheet['!views'].push({ rightToLeft: true });
+    // Add attendance sheet
+    const attendanceSheet = XLSX.utils.json_to_sheet(excelData);
+    if (!attendanceSheet['!views']) attendanceSheet['!views'] = [];
+    attendanceSheet['!views'].push({ rightToLeft: true });
+    XLSX.utils.book_append_sheet(workbook, attendanceSheet, "تقرير الحضور");
 
-    XLSX.utils.book_append_sheet(workbook, worksheet, "تقرير العمل");
+    // Add advances sheet if there are any
+    if (advancesData && advancesData.length > 0) {
+      const advancesExcelData = advancesData.map(advance => ({
+        "اسم الموظف": advance.user_name,
+        "المبلغ (جنيه)": advance.amount.toFixed(2),
+        "التاريخ": new Date(advance.created_at).toLocaleDateString('ar-EG'),
+        "الوقت": new Date(advance.created_at).toLocaleTimeString('ar-EG'),
+      }));
+
+      // Calculate total advances
+      const totalAdvances = advancesData.reduce((sum, adv) => sum + adv.amount, 0);
+      advancesExcelData.push({
+        "اسم الموظف": "المجموع الكلي",
+        "المبلغ (جنيه)": totalAdvances.toFixed(2),
+        "التاريخ": "",
+        "الوقت": "",
+      });
+
+      const advancesSheet = XLSX.utils.json_to_sheet(advancesExcelData);
+      if (!advancesSheet['!views']) advancesSheet['!views'] = [];
+      advancesSheet['!views'].push({ rightToLeft: true });
+      XLSX.utils.book_append_sheet(workbook, advancesSheet, "السلف");
+    }
     
     // Generate filename based on filter
-    const fileName = selectedWorker === "all" 
-      ? "Work_Hours_Report.xlsx"
-      : `${workers.find(w => w.user_id === selectedWorker)?.user_name || "Worker"}_Report.xlsx`;
+    const workerName = workerIdToDownload === "all" 
+      ? "جميع_الموظفين"
+      : workers.find(w => w.user_id === workerIdToDownload)?.user_name || "موظف";
+    
+    const fileName = `تقرير_${workerName}_${new Date().toLocaleDateString('en-CA')}.xlsx`;
     
     XLSX.writeFile(workbook, fileName);
     toast.success("تم تحميل التقرير بنجاح!");
+    setShowExcelDialog(false);
+    setSelectedWorkerForExcel("all");
   };
 
   const handleLogout = async () => {
@@ -285,7 +377,7 @@ const Index = () => {
             <p className="text-muted-foreground mt-1">إنشاء رموز QR ومتابعة سجلات الموظفين</p>
           </div>
           <div className="flex gap-4">
-            <Button variant="outline" onClick={downloadExcel} className="bg-green-50 text-green-700 hover:bg-green-100 border-green-200">
+            <Button variant="outline" onClick={handleDownloadExcel} className="bg-green-50 text-green-700 hover:bg-green-100 border-green-200">
               <Download className="w-4 h-4 ml-2" />
               تصدير التقرير مفصل
             </Button>
@@ -295,6 +387,46 @@ const Index = () => {
             </Button>
           </div>
         </div>
+
+        {/* Excel Download Dialog */}
+        {showExcelDialog && (
+          <Card className="p-6 mb-8 border-2 border-primary">
+            <h3 className="text-lg font-semibold mb-4">اختر الموظف لتصدير التقرير</h3>
+            <div className="space-y-4">
+              <div>
+                <Label htmlFor="excel-worker-select">اختيار الموظف</Label>
+                <Select 
+                  value={selectedWorkerForExcel} 
+                  onValueChange={setSelectedWorkerForExcel}
+                >
+                  <SelectTrigger id="excel-worker-select" className="mt-2">
+                    <SelectValue placeholder="اختر موظفاً" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">جميع الموظفين</SelectItem>
+                    {workers.map((worker) => (
+                      <SelectItem key={worker.user_id} value={worker.user_id}>
+                        {worker.user_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex gap-3">
+                <Button onClick={downloadExcel} className="flex-1">
+                  <Download className="w-4 h-4 ml-2" />
+                  تحميل التقرير
+                </Button>
+                <Button variant="outline" onClick={() => setShowExcelDialog(false)} className="flex-1">
+                  إلغاء
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                💡 سيتم تضمين سجلات الحضور والسلف للموظف المختار
+              </p>
+            </div>
+          </Card>
+        )}
 
         <Tabs defaultValue="qr" className="w-full">
           <TabsList className="grid w-full grid-cols-2 mb-8">
@@ -444,17 +576,17 @@ const Index = () => {
                     </Select>
                     {workers.length === 0 && (
                       <p className="text-xs text-amber-600 mt-2">
-                        تنبيه: لا يوجد موظفين في قاعدة البيانات. يرجى التأكد من وجود سجلات في جدول attendance
+                        تنبيه: لا يوجد موظفين في قاعدة البيانات. يرجى التأكد من وجود سجلات في جدول user_roles
                       </p>
                     )}
                   </div>
 
                   <div>
-                    <Label htmlFor="advance-amount">قيمة السلفة</Label>
+                    <Label htmlFor="advance-amount">قيمة السلفة (جنيه)</Label>
                     <Input
                       id="advance-amount"
                       type="number"
-                      placeholder="أدخل المبلغ"
+                      placeholder="أدخل المبلغ بالجنيه"
                       value={advanceAmount}
                       onChange={(e) => setAdvanceAmount(e.target.value)}
                       className="mt-2"
@@ -498,7 +630,7 @@ const Index = () => {
                           </span>
                         </div>
                         <span className="text-lg font-semibold text-green-600">
-                          {advance.amount.toFixed(2)} ريال
+                          {advance.amount.toFixed(2)} جنيه
                         </span>
                         <span className="text-xs text-muted-foreground mt-1">
                           {new Date(advance.created_at).toLocaleTimeString('ar-EG')}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -25,7 +25,11 @@ import {
   Clock,
   TrendingUp,
   FileSpreadsheet,
-  DollarSign
+  DollarSign,
+  Edit,
+  Plus,
+  AlertTriangle,
+  ChevronDown
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import * as XLSX from "xlsx";
@@ -41,6 +45,26 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 
 interface Worker {
   user_id: string;
@@ -68,6 +92,8 @@ const Index = () => {
   const [qrToken, setQrToken] = useState<string>("");
   const [scanType, setScanType] = useState<"حضور" | "انصراف">("حضور");
   const [scans, setScans] = useState<any[]>([]);
+  const [scansPage, setScansPage] = useState(1);
+  const [hasMoreScans, setHasMoreScans] = useState(true);
   
   // Worker filtering state
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -85,19 +111,40 @@ const Index = () => {
   const [selectedWorkerForExcel, setSelectedWorkerForExcel] = useState<string>("all");
   const [showExcelDialog, setShowExcelDialog] = useState(false);
   
-  // Date range for Excel
+  // Date range filtering
   const [startDate, setStartDate] = useState<string>("");
   const [endDate, setEndDate] = useState<string>("");
+  const [filterStartDate, setFilterStartDate] = useState<string>("");
+  const [filterEndDate, setFilterEndDate] = useState<string>("");
 
-  // Delete advance dialog
+  // Delete/Edit advance dialogs
   const [advanceToDelete, setAdvanceToDelete] = useState<string | null>(null);
+  const [advanceToEdit, setAdvanceToEdit] = useState<Advance | null>(null);
+  const [editAdvanceAmount, setEditAdvanceAmount] = useState<string>("");
+
+  // Manual attendance entry
+  const [showManualEntry, setShowManualEntry] = useState(false);
+  const [manualWorker, setManualWorker] = useState<string>("");
+  const [manualDate, setManualDate] = useState<string>("");
+  const [manualTime, setManualTime] = useState<string>("");
+  const [manualType, setManualType] = useState<"حضور" | "انصراف">("حضور");
+
+  // Hourly rate
+  const [hourlyRate, setHourlyRate] = useState<number>(50); // Default 50 EGP/hour
+  const [showRateDialog, setShowRateDialog] = useState(false);
+  const [tempHourlyRate, setTempHourlyRate] = useState<string>("50");
+
+  // Combobox state
+  const [openWorkerCombo, setOpenWorkerCombo] = useState(false);
+  const [openAdvanceCombo, setOpenAdvanceCombo] = useState(false);
+  const [openManualCombo, setOpenManualCombo] = useState(false);
+
+  // Auto-refresh with real-time
+  const [useRealtime, setUseRealtime] = useState(true);
 
   // Stats
   const [workerStats, setWorkerStats] = useState<Record<string, AttendanceStats>>({});
   const [totalAdvancesByWorker, setTotalAdvancesByWorker] = useState<Record<string, number>>({});
-
-  // Auto-refresh
-  const [autoRefresh, setAutoRefresh] = useState(true);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -122,19 +169,95 @@ const Index = () => {
     const thirtyDaysAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
     setEndDate(today.toISOString().split('T')[0]);
     setStartDate(thirtyDaysAgo.toISOString().split('T')[0]);
+    setFilterEndDate(today.toISOString().split('T')[0]);
+    setFilterStartDate("");
   }, [navigate]);
 
+  // Real-time subscription for attendance
   useEffect(() => {
-    // Filter scans based on selected worker
-    if (selectedWorker === "all") {
-      setFilteredScans(scans);
-    } else {
-      setFilteredScans(scans.filter(scan => scan.user_id === selectedWorker));
-    }
-  }, [selectedWorker, scans]);
+    if (!useRealtime) return;
+
+    const channel = supabase
+      .channel('attendance-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'attendance'
+        },
+        (payload) => {
+          console.log('New attendance record:', payload);
+          setScans(prevScans => [payload.new, ...prevScans]);
+          toast.success("تم تسجيل حضور/انصراف جديد!");
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [useRealtime]);
+
+  // Real-time subscription for advances
+  useEffect(() => {
+    if (!useRealtime) return;
+
+    const channel = supabase
+      .channel('advances-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'advances'
+        },
+        (payload) => {
+          console.log('Advances change:', payload);
+          if (payload.eventType === 'INSERT') {
+            setAdvances(prevAdvances => [payload.new as Advance, ...prevAdvances]);
+          } else if (payload.eventType === 'DELETE') {
+            setAdvances(prevAdvances => prevAdvances.filter(a => a.id !== payload.old.id));
+          } else if (payload.eventType === 'UPDATE') {
+            setAdvances(prevAdvances => 
+              prevAdvances.map(a => a.id === payload.new.id ? payload.new as Advance : a)
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [useRealtime]);
 
   useEffect(() => {
-    // Filter advances based on selected worker
+    // Filter scans based on selected worker and date range
+    let filtered = scans;
+    
+    if (selectedWorker !== "all") {
+      filtered = filtered.filter(scan => scan.user_id === selectedWorker);
+    }
+
+    if (filterStartDate) {
+      filtered = filtered.filter(scan => {
+        const scanDate = new Date(scan.scanned_at).toISOString().split('T')[0];
+        return scanDate >= filterStartDate;
+      });
+    }
+
+    if (filterEndDate) {
+      filtered = filtered.filter(scan => {
+        const scanDate = new Date(scan.scanned_at).toISOString().split('T')[0];
+        return scanDate <= filterEndDate;
+      });
+    }
+
+    setFilteredScans(filtered);
+  }, [selectedWorker, scans, filterStartDate, filterEndDate]);
+
+  useEffect(() => {
     if (selectedAdvanceWorker === "all") {
       setFilteredAdvances(advances);
     } else {
@@ -143,7 +266,6 @@ const Index = () => {
   }, [selectedAdvanceWorker, advances]);
 
   useEffect(() => {
-    // Calculate total advances per worker
     const totals: Record<string, number> = {};
     advances.forEach(advance => {
       if (!totals[advance.user_id]) {
@@ -154,21 +276,83 @@ const Index = () => {
     setTotalAdvancesByWorker(totals);
   }, [advances]);
 
-  useEffect(() => {
-    // Auto-refresh every 30 seconds
-    if (!autoRefresh) return;
-    
-    const interval = setInterval(() => {
-      fetchScans();
-      fetchAdvances();
-    }, 30000);
+  // Memoized worker stats calculation
+  const calculateWorkerStats = useCallback(() => {
+    const stats: Record<string, AttendanceStats> = {};
 
-    return () => clearInterval(interval);
-  }, [autoRefresh]);
+    scans.forEach(scan => {
+      if (!stats[scan.user_id]) {
+        stats[scan.user_id] = {
+          totalDays: 0,
+          totalHours: 0,
+          avgHoursPerDay: 0,
+          daysPresent: 0
+        };
+      }
+    });
 
-  useEffect(() => {
-    calculateWorkerStats();
+    const scansByDate: Record<string, any[]> = {};
+    scans.forEach(scan => {
+      const dateKey = new Date(scan.scanned_at).toLocaleDateString('en-CA');
+      const groupKey = `${scan.user_id}_${dateKey}`;
+      if (!scansByDate[groupKey]) {
+        scansByDate[groupKey] = [];
+      }
+      scansByDate[groupKey].push(scan);
+    });
+
+    Object.entries(scansByDate).forEach(([key, dayScans]) => {
+      const userId = key.split('_')[0];
+      const checkIns = dayScans.filter(s => s.qr_data.includes("حضور"));
+      const checkOuts = dayScans.filter(s => s.qr_data.includes("انصراف"));
+
+      if (checkIns.length > 0 && checkOuts.length > 0) {
+        const firstCheckIn = new Date(checkIns[0].scanned_at);
+        const lastCheckOut = new Date(checkOuts[checkOuts.length - 1].scanned_at);
+        const hours = (lastCheckOut.getTime() - firstCheckIn.getTime()) / (1000 * 60 * 60);
+        
+        if (hours > 0) {
+          stats[userId].totalHours += hours;
+          stats[userId].daysPresent += 1;
+        }
+      }
+    });
+
+    Object.keys(stats).forEach(userId => {
+      if (stats[userId].daysPresent > 0) {
+        stats[userId].avgHoursPerDay = stats[userId].totalHours / stats[userId].daysPresent;
+      }
+    });
+
+    return stats;
   }, [scans]);
+
+  const memoizedWorkerStats = useMemo(() => calculateWorkerStats(), [calculateWorkerStats]);
+
+  useEffect(() => {
+    setWorkerStats(memoizedWorkerStats);
+  }, [memoizedWorkerStats]);
+
+  // Calculate payroll info
+  const payrollInfo = useMemo(() => {
+    return workers.map(worker => {
+      const hours = workerStats[worker.user_id]?.totalHours || 0;
+      const advances = totalAdvancesByWorker[worker.user_id] || 0;
+      const earned = hours * hourlyRate;
+      const net = earned - advances;
+      const isOverdrawn = advances > earned;
+
+      return {
+        worker_id: worker.user_id,
+        worker_name: worker.user_name,
+        hours,
+        earned,
+        advances,
+        net,
+        isOverdrawn
+      };
+    });
+  }, [workers, workerStats, totalAdvancesByWorker, hourlyRate]);
 
   const generateNewToken = (type: "حضور" | "انصراف") => {
     setScanType(type);
@@ -176,18 +360,36 @@ const Index = () => {
     setQrToken(`${type}-${randomString}`);
   };
 
-  const fetchScans = async () => {
-    const { data, error } = await supabase
+  const fetchScans = async (page = 1) => {
+    const limit = 50;
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const { data, error, count } = await supabase
       .from("attendance")
-      .select("*")
+      .select("*", { count: 'exact' })
       .order("scanned_at", { ascending: false })
-      .limit(100);
+      .range(from, to);
       
     if (error) {
       console.error("Error fetching scans:", error);
       return;
     }
-    if (data) setScans(data);
+    
+    if (data) {
+      if (page === 1) {
+        setScans(data);
+      } else {
+        setScans(prev => [...prev, ...data]);
+      }
+      setHasMoreScans(data.length === limit);
+    }
+  };
+
+  const loadMoreScans = () => {
+    const nextPage = scansPage + 1;
+    setScansPage(nextPage);
+    fetchScans(nextPage);
   };
 
   const fetchWorkers = async () => {
@@ -279,59 +481,6 @@ const Index = () => {
     if (data) setAdvances(data);
   };
 
-  const calculateWorkerStats = () => {
-    const stats: Record<string, AttendanceStats> = {};
-
-    scans.forEach(scan => {
-      if (!stats[scan.user_id]) {
-        stats[scan.user_id] = {
-          totalDays: 0,
-          totalHours: 0,
-          avgHoursPerDay: 0,
-          daysPresent: 0
-        };
-      }
-    });
-
-    // Group by date
-    const scansByDate: Record<string, any[]> = {};
-    scans.forEach(scan => {
-      const dateKey = new Date(scan.scanned_at).toLocaleDateString('en-CA');
-      const groupKey = `${scan.user_id}_${dateKey}`;
-      if (!scansByDate[groupKey]) {
-        scansByDate[groupKey] = [];
-      }
-      scansByDate[groupKey].push(scan);
-    });
-
-    // Calculate hours
-    Object.entries(scansByDate).forEach(([key, dayScans]) => {
-      const userId = key.split('_')[0];
-      const checkIns = dayScans.filter(s => s.qr_data.includes("حضور"));
-      const checkOuts = dayScans.filter(s => s.qr_data.includes("انصراف"));
-
-      if (checkIns.length > 0 && checkOuts.length > 0) {
-        const firstCheckIn = new Date(checkIns[0].scanned_at);
-        const lastCheckOut = new Date(checkOuts[checkOuts.length - 1].scanned_at);
-        const hours = (lastCheckOut.getTime() - firstCheckIn.getTime()) / (1000 * 60 * 60);
-        
-        if (hours > 0) {
-          stats[userId].totalHours += hours;
-          stats[userId].daysPresent += 1;
-        }
-      }
-    });
-
-    // Calculate averages
-    Object.keys(stats).forEach(userId => {
-      if (stats[userId].daysPresent > 0) {
-        stats[userId].avgHoursPerDay = stats[userId].totalHours / stats[userId].daysPresent;
-      }
-    });
-
-    setWorkerStats(stats);
-  };
-
   const handleSaveAdvance = async () => {
     if (!selectedWorkerForAdvance || !advanceAmount) {
       toast.error("الرجاء اختيار الموظف وإدخال المبلغ");
@@ -350,6 +499,19 @@ const Index = () => {
       return;
     }
 
+    // Check advance limit
+    const payroll = payrollInfo.find(p => p.worker_id === selectedWorkerForAdvance);
+    if (payroll) {
+      const currentAdvances = payroll.advances;
+      const totalAfter = currentAdvances + amount;
+      if (totalAfter > payroll.earned) {
+        toast.error(
+          `⚠️ تحذير: السلفة تتجاوز الراتب المكتسب!\nالراتب المكتسب: ${payroll.earned.toFixed(2)} جنيه\nالسلف الحالية: ${currentAdvances.toFixed(2)} جنيه\nالسلفة الجديدة: ${amount.toFixed(2)} جنيه\nالإجمالي: ${totalAfter.toFixed(2)} جنيه`,
+          { duration: 5000 }
+        );
+      }
+    }
+
     const { error } = await supabase.from("advances").insert({
       user_id: worker.user_id,
       user_name: worker.user_name,
@@ -365,7 +527,32 @@ const Index = () => {
     toast.success("تم حفظ السلفة بنجاح!");
     setAdvanceAmount("");
     setSelectedWorkerForAdvance("");
-    fetchAdvances();
+    setOpenAdvanceCombo(false);
+  };
+
+  const handleEditAdvance = async () => {
+    if (!advanceToEdit || !editAdvanceAmount) return;
+
+    const amount = parseFloat(editAdvanceAmount);
+    if (isNaN(amount) || amount <= 0) {
+      toast.error("الرجاء إدخال مبلغ صحيح");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("advances")
+      .update({ amount })
+      .eq("id", advanceToEdit.id);
+
+    if (error) {
+      toast.error("حدث خطأ أثناء تعديل السلفة");
+      console.error(error);
+      return;
+    }
+
+    toast.success("تم تعديل السلفة بنجاح!");
+    setAdvanceToEdit(null);
+    setEditAdvanceAmount("");
   };
 
   const handleDeleteAdvance = async () => {
@@ -384,7 +571,65 @@ const Index = () => {
 
     toast.success("تم حذف السلفة بنجاح");
     setAdvanceToDelete(null);
-    fetchAdvances();
+  };
+
+  const handleManualEntry = async () => {
+    if (!manualWorker || !manualDate || !manualTime) {
+      toast.error("الرجاء إكمال جميع الحقول");
+      return;
+    }
+
+    const worker = workers.find(w => w.user_id === manualWorker);
+    if (!worker) {
+      toast.error("الموظف غير موجود");
+      return;
+    }
+
+    const dateTime = new Date(`${manualDate}T${manualTime}`);
+    
+    const { error } = await supabase.from("attendance").insert({
+      user_id: worker.user_id,
+      user_name: worker.user_name,
+      qr_data: `${manualType}-manual`,
+      scanned_at: dateTime.toISOString(),
+    });
+
+    if (error) {
+      toast.error("حدث خطأ أثناء التسجيل");
+      console.error(error);
+      return;
+    }
+
+    toast.success("تم التسجيل اليدوي بنجاح!");
+    setShowManualEntry(false);
+    setManualWorker("");
+    setManualDate("");
+    setManualTime("");
+    setOpenManualCombo(false);
+    fetchScans(1);
+  };
+
+  const handleSaveHourlyRate = () => {
+    const rate = parseFloat(tempHourlyRate);
+    if (isNaN(rate) || rate <= 0) {
+      toast.error("الرجاء إدخال سعر صحيح");
+      return;
+    }
+    setHourlyRate(rate);
+    setShowRateDialog(false);
+    toast.success(`تم تعيين سعر الساعة: ${rate} جنيه`);
+  };
+
+  const isLatCheckIn = (scanTime: string) => {
+    const time = new Date(scanTime);
+    const hours = time.getHours();
+    return hours >= 9; // After 9 AM is late
+  };
+
+  const isEarlyCheckOut = (scanTime: string) => {
+    const time = new Date(scanTime);
+    const hours = time.getHours();
+    return hours < 17; // Before 5 PM is early
   };
 
   const handleDownloadExcel = () => {
@@ -403,7 +648,6 @@ const Index = () => {
       query = query.eq("user_id", workerIdToDownload);
     }
 
-    // Apply date filter
     if (startDate) {
       query = query.gte("scanned_at", new Date(startDate).toISOString());
     }
@@ -491,12 +735,10 @@ const Index = () => {
 
     excelData.reverse();
 
-    // Calculate totals
     const totalHours = excelData.reduce((sum, row) => {
       return sum + parseFloat(row["ساعات العمل"] || "0");
     }, 0);
 
-    // Add summary row
     excelData.push({
       "اسم الموظف": "الإجمالي",
       "التاريخ": "",
@@ -535,41 +777,24 @@ const Index = () => {
       XLSX.utils.book_append_sheet(workbook, advancesSheet, "السلف");
     }
 
-    // Add summary sheet
-    const summaryData = [];
-    if (workerIdToDownload === "all") {
-      workers.forEach(worker => {
-        const workerHours = workerStats[worker.user_id]?.totalHours || 0;
-        const workerDays = workerStats[worker.user_id]?.daysPresent || 0;
-        const workerAvg = workerStats[worker.user_id]?.avgHoursPerDay || 0;
-        const workerAdvances = totalAdvancesByWorker[worker.user_id] || 0;
+    // Payroll summary sheet
+    const payrollSummary = payrollInfo
+      .filter(p => workerIdToDownload === "all" || p.worker_id === workerIdToDownload)
+      .map(p => ({
+        "الموظف": p.worker_name,
+        "إجمالي الساعات": p.hours.toFixed(2),
+        "سعر الساعة": hourlyRate.toFixed(2),
+        "الراتب المكتسب": p.earned.toFixed(2),
+        "إجمالي السلف": p.advances.toFixed(2),
+        "صافي الراتب": p.net.toFixed(2),
+        "الحالة": p.isOverdrawn ? "⚠️ متجاوز" : "✅ طبيعي"
+      }));
 
-        summaryData.push({
-          "الموظف": worker.user_name,
-          "إجمالي الساعات": workerHours.toFixed(2),
-          "عدد الأيام": workerDays,
-          "متوسط الساعات/يوم": workerAvg.toFixed(2),
-          "إجمالي السلف (جنيه)": workerAdvances.toFixed(2),
-        });
-      });
-    } else {
-      const worker = workers.find(w => w.user_id === workerIdToDownload);
-      if (worker) {
-        summaryData.push({
-          "الموظف": worker.user_name,
-          "إجمالي الساعات": (workerStats[worker.user_id]?.totalHours || 0).toFixed(2),
-          "عدد الأيام": workerStats[worker.user_id]?.daysPresent || 0,
-          "متوسط الساعات/يوم": (workerStats[worker.user_id]?.avgHoursPerDay || 0).toFixed(2),
-          "إجمالي السلف (جنيه)": (totalAdvancesByWorker[worker.user_id] || 0).toFixed(2),
-        });
-      }
-    }
-
-    if (summaryData.length > 0) {
-      const summarySheet = XLSX.utils.json_to_sheet(summaryData);
-      if (!summarySheet['!views']) summarySheet['!views'] = [];
-      summarySheet['!views'].push({ rightToLeft: true });
-      XLSX.utils.book_append_sheet(workbook, summarySheet, "الملخص");
+    if (payrollSummary.length > 0) {
+      const payrollSheet = XLSX.utils.json_to_sheet(payrollSummary);
+      if (!payrollSheet['!views']) payrollSheet['!views'] = [];
+      payrollSheet['!views'].push({ rightToLeft: true });
+      XLSX.utils.book_append_sheet(workbook, payrollSheet, "كشف الرواتب");
     }
     
     const workerName = workerIdToDownload === "all" 
@@ -592,6 +817,15 @@ const Index = () => {
     navigate("/auth");
   };
 
+  // Calculate total payroll
+  const totalPayroll = useMemo(() => {
+    return payrollInfo.reduce((acc, p) => ({
+      earned: acc.earned + p.earned,
+      advances: acc.advances + p.advances,
+      net: acc.net + p.net
+    }), { earned: 0, advances: 0, net: 0 });
+  }, [payrollInfo]);
+
   return (
     <div className="min-h-screen bg-background p-8" dir="rtl">
       <div className="max-w-6xl mx-auto">
@@ -603,16 +837,24 @@ const Index = () => {
           </div>
           <div className="flex gap-4">
             <Button 
-              variant={autoRefresh ? "default" : "outline"} 
-              size="icon"
-              onClick={() => setAutoRefresh(!autoRefresh)}
-              title={autoRefresh ? "إيقاف التحديث التلقائي" : "تفعيل التحديث التلقائي"}
+              variant="outline"
+              onClick={() => setShowRateDialog(true)}
+              className="bg-purple-50 text-purple-700 hover:bg-purple-100"
             >
-              <RefreshCw className={`w-4 h-4 ${autoRefresh ? 'animate-spin' : ''}`} />
+              <DollarSign className="w-4 h-4 ml-2" />
+              {hourlyRate} جنيه/ساعة
+            </Button>
+            <Button 
+              variant={useRealtime ? "default" : "outline"} 
+              size="icon"
+              onClick={() => setUseRealtime(!useRealtime)}
+              title={useRealtime ? "الاتصال المباشر مفعّل" : "تفعيل الاتصال المباشر"}
+            >
+              <RefreshCw className={`w-4 h-4 ${useRealtime ? 'animate-pulse' : ''}`} />
             </Button>
             <Button variant="outline" onClick={handleDownloadExcel} className="bg-green-50 text-green-700 hover:bg-green-100 border-green-200">
               <Download className="w-4 h-4 ml-2" />
-              تصدير التقرير مفصل
+              تصدير التقرير
             </Button>
             <Button variant="outline" onClick={handleLogout}>
               <LogOut className="w-4 h-4 ml-2" />
@@ -632,27 +874,11 @@ const Index = () => {
               <Users className="w-8 h-8 text-primary" />
             </div>
           </Card>
-          <Card className="p-4">
+          <Card className="p-4 cursor-pointer hover:bg-accent transition-colors" onClick={() => setShowRateDialog(true)}>
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-muted-foreground">سجلات اليوم</p>
-                <p className="text-2xl font-bold">
-                  {scans.filter(s => {
-                    const today = new Date().toLocaleDateString('en-CA');
-                    return new Date(s.scanned_at).toLocaleDateString('en-CA') === today;
-                  }).length}
-                </p>
-              </div>
-              <Clock className="w-8 h-8 text-blue-500" />
-            </div>
-          </Card>
-          <Card className="p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground">إجمالي السلف</p>
-                <p className="text-2xl font-bold">
-                  {advances.reduce((sum, adv) => sum + adv.amount, 0).toFixed(0)} جنيه
-                </p>
+                <p className="text-sm text-muted-foreground">إجمالي الرواتب</p>
+                <p className="text-2xl font-bold">{totalPayroll.earned.toFixed(0)} جنيه</p>
               </div>
               <DollarSign className="w-8 h-8 text-green-500" />
             </div>
@@ -660,15 +886,58 @@ const Index = () => {
           <Card className="p-4">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-muted-foreground">آخر تحديث</p>
-                <p className="text-sm font-medium">
-                  {new Date().toLocaleTimeString('ar-EG')}
-                </p>
+                <p className="text-sm text-muted-foreground">إجمالي السلف</p>
+                <p className="text-2xl font-bold">{totalPayroll.advances.toFixed(0)} جنيه</p>
               </div>
-              <TrendingUp className="w-8 h-8 text-purple-500" />
+              <Banknote className="w-8 h-8 text-amber-500" />
+            </div>
+          </Card>
+          <Card className="p-4 bg-gradient-to-br from-primary/10 to-primary/5">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">صافي المستحق</p>
+                <p className="text-2xl font-bold text-primary">{totalPayroll.net.toFixed(0)} جنيه</p>
+              </div>
+              <TrendingUp className="w-8 h-8 text-primary" />
             </div>
           </Card>
         </div>
+
+        {/* Date Range Filter */}
+        <Card className="p-4 mb-8">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+            <div>
+              <Label htmlFor="filter-start">من تاريخ</Label>
+              <Input
+                id="filter-start"
+                type="date"
+                value={filterStartDate}
+                onChange={(e) => setFilterStartDate(e.target.value)}
+                className="mt-2"
+              />
+            </div>
+            <div>
+              <Label htmlFor="filter-end">إلى تاريخ</Label>
+              <Input
+                id="filter-end"
+                type="date"
+                value={filterEndDate}
+                onChange={(e) => setFilterEndDate(e.target.value)}
+                className="mt-2"
+              />
+            </div>
+            <Button 
+              variant="outline" 
+              onClick={() => {
+                setFilterStartDate("");
+                setFilterEndDate(new Date().toISOString().split('T')[0]);
+              }}
+            >
+              <Calendar className="w-4 h-4 ml-2" />
+              إعادة تعيين
+            </Button>
+          </div>
+        </Card>
 
         {/* Excel Download Dialog */}
         {showExcelDialog && (
@@ -680,12 +949,9 @@ const Index = () => {
             <div className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
-                  <Label htmlFor="excel-worker-select">اختيار الموظف</Label>
-                  <Select 
-                    value={selectedWorkerForExcel} 
-                    onValueChange={setSelectedWorkerForExcel}
-                  >
-                    <SelectTrigger id="excel-worker-select" className="mt-2">
+                  <Label>اختيار الموظف</Label>
+                  <Select value={selectedWorkerForExcel} onValueChange={setSelectedWorkerForExcel}>
+                    <SelectTrigger className="mt-2">
                       <SelectValue placeholder="اختر موظفاً" />
                     </SelectTrigger>
                     <SelectContent>
@@ -735,7 +1001,7 @@ const Index = () => {
                 <ul className="text-xs text-blue-700 mt-2 mr-4 space-y-1">
                   <li>• تقرير الحضور والانصراف مع إجمالي الساعات</li>
                   <li>• سجل السلف مع المجموع الكلي</li>
-                  <li>• ملخص إحصائي شامل</li>
+                  <li>• كشف الرواتب الشامل (الساعات × السعر - السلف)</li>
                 </ul>
               </div>
             </div>
@@ -795,56 +1061,123 @@ const Index = () => {
               </Card>
 
               <Card className="p-6">
-                <div className="flex justify-between items-center mb-6">
+                <div className="flex justify-between items-center mb-4">
                   <h2 className="text-xl font-semibold">أحدث السجلات</h2>
-                  <Button variant="ghost" size="icon" onClick={fetchScans} title="تحديث">
-                    <RefreshCw className="w-4 h-4" />
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button 
+                      variant="outline" 
+                      size="sm"
+                      onClick={() => setShowManualEntry(true)}
+                    >
+                      <Plus className="w-4 h-4 ml-1" />
+                      تسجيل يدوي
+                    </Button>
+                    <Button variant="ghost" size="icon" onClick={() => fetchScans(1)}>
+                      <RefreshCw className="w-4 h-4" />
+                    </Button>
+                  </div>
                 </div>
 
                 <div className="mb-4">
-                  <Label htmlFor="worker-filter" className="mb-2 block">
-                    <Users className="w-4 h-4 inline ml-2" />
-                    تصفية حسب الموظف
-                  </Label>
-                  <Select value={selectedWorker} onValueChange={setSelectedWorker}>
-                    <SelectTrigger id="worker-filter">
-                      <SelectValue placeholder="اختر موظفاً" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">جميع الموظفين ({scans.length})</SelectItem>
-                      {workers.map((worker) => {
-                        const workerScansCount = scans.filter(s => s.user_id === worker.user_id).length;
-                        return (
-                          <SelectItem key={worker.user_id} value={worker.user_id}>
-                            {worker.user_name} ({workerScansCount})
-                          </SelectItem>
-                        );
-                      })}
-                    </SelectContent>
-                  </Select>
+                  <Popover open={openWorkerCombo} onOpenChange={setOpenWorkerCombo}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        role="combobox"
+                        aria-expanded={openWorkerCombo}
+                        className="w-full justify-between"
+                      >
+                        {selectedWorker === "all" 
+                          ? `جميع الموظفين (${scans.length})`
+                          : workers.find(w => w.user_id === selectedWorker)?.user_name || "اختر موظفاً"
+                        }
+                        <ChevronDown className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent className="w-full p-0">
+                      <Command>
+                        <CommandInput placeholder="ابحث عن موظف..." />
+                        <CommandEmpty>لا يوجد موظف بهذا الاسم</CommandEmpty>
+                        <CommandGroup>
+                          <CommandItem
+                            value="all"
+                            onSelect={() => {
+                              setSelectedWorker("all");
+                              setOpenWorkerCombo(false);
+                            }}
+                          >
+                            جميع الموظفين ({scans.length})
+                          </CommandItem>
+                          {workers.map((worker) => {
+                            const count = scans.filter(s => s.user_id === worker.user_id).length;
+                            return (
+                              <CommandItem
+                                key={worker.user_id}
+                                value={worker.user_name}
+                                onSelect={() => {
+                                  setSelectedWorker(worker.user_id);
+                                  setOpenWorkerCombo(false);
+                                }}
+                              >
+                                {worker.user_name} ({count})
+                              </CommandItem>
+                            );
+                          })}
+                        </CommandGroup>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
                 </div>
                 
                 <div className="space-y-4 overflow-y-auto max-h-[400px] pr-2">
                   {filteredScans.length === 0 ? (
                     <p className="text-center text-muted-foreground py-8">لا توجد سجلات بعد...</p>
                   ) : (
-                    filteredScans.map((scan) => (
-                      <div key={scan.id} className="flex flex-col p-3 border rounded-lg bg-card hover:bg-accent transition-colors">
-                        <div className="flex justify-between items-start mb-2">
-                          <span className={`text-sm font-bold ${scan.qr_data.includes("حضور") ? "text-primary" : "text-red-500"}`}>
-                            {scan.qr_data.includes("حضور") ? "✓ تسجيل حضور" : "✗ تسجيل انصراف"}
-                          </span>
-                          <div className="text-xs text-muted-foreground">
-                            <div dir="ltr">{new Date(scan.scanned_at).toLocaleTimeString('ar-EG')}</div>
-                            <div className="text-right">{new Date(scan.scanned_at).toLocaleDateString('ar-EG')}</div>
+                    <>
+                      {filteredScans.map((scan) => {
+                        const isCheckIn = scan.qr_data.includes("حضور");
+                        const isLate = isCheckIn && isLatCheckIn(scan.scanned_at);
+                        const isEarly = !isCheckIn && isEarlyCheckOut(scan.scanned_at);
+                        
+                        return (
+                          <div 
+                            key={scan.id} 
+                            className={`flex flex-col p-3 border rounded-lg transition-colors ${
+                              isLate ? 'bg-red-50 border-red-200' : 
+                              isEarly ? 'bg-yellow-50 border-yellow-200' : 
+                              'bg-card hover:bg-accent'
+                            }`}
+                          >
+                            <div className="flex justify-between items-start mb-2">
+                              <div className="flex items-center gap-2">
+                                <span className={`text-sm font-bold ${isCheckIn ? "text-primary" : "text-red-500"}`}>
+                                  {isCheckIn ? "✓ تسجيل حضور" : "✗ تسجيل انصراف"}
+                                </span>
+                                {isLate && <AlertTriangle className="w-4 h-4 text-red-500" title="متأخر" />}
+                                {isEarly && <AlertTriangle className="w-4 h-4 text-yellow-500" title="انصراف مبكر" />}
+                              </div>
+                              <div className="text-xs text-muted-foreground text-left">
+                                <div dir="ltr">{new Date(scan.scanned_at).toLocaleTimeString('ar-EG')}</div>
+                                <div>{new Date(scan.scanned_at).toLocaleDateString('ar-EG')}</div>
+                              </div>
+                            </div>
+                            <span className="text-sm font-medium mt-1">
+                              الموظف: {scan.user_name || scan.user_id}
+                            </span>
                           </div>
-                        </div>
-                        <span className="text-sm font-medium mt-1">
-                          الموظف: {scan.user_name || scan.user_id}
-                        </span>
-                      </div>
-                    ))
+                        );
+                      })}
+                      {hasMoreScans && (
+                        <Button 
+                          variant="outline" 
+                          className="w-full"
+                          onClick={loadMoreScans}
+                        >
+                          <ChevronDown className="w-4 h-4 ml-2" />
+                          تحميل المزيد
+                        </Button>
+                      )}
+                    </>
                   )}
                 </div>
               </Card>
@@ -861,29 +1194,58 @@ const Index = () => {
 
                 <div className="space-y-4">
                   <div>
-                    <Label htmlFor="worker-select">اختيار الموظف</Label>
-                    <Select 
-                      value={selectedWorkerForAdvance} 
-                      onValueChange={setSelectedWorkerForAdvance}
-                    >
-                      <SelectTrigger id="worker-select" className="mt-2">
-                        <SelectValue placeholder="اختر موظفاً" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {workers.length === 0 ? (
-                          <SelectItem value="none" disabled>لا يوجد موظفين</SelectItem>
-                        ) : (
-                          workers.map((worker) => {
-                            const totalAdvances = totalAdvancesByWorker[worker.user_id] || 0;
-                            return (
-                              <SelectItem key={worker.user_id} value={worker.user_id}>
-                                {worker.user_name} {totalAdvances > 0 ? `(${totalAdvances.toFixed(0)} جنيه)` : ''}
-                              </SelectItem>
-                            );
-                          })
-                        )}
-                      </SelectContent>
-                    </Select>
+                    <Label>اختيار الموظف</Label>
+                    <Popover open={openAdvanceCombo} onOpenChange={setOpenAdvanceCombo}>
+                      <PopoverTrigger asChild>
+                        <Button
+                          variant="outline"
+                          role="combobox"
+                          className="w-full justify-between mt-2"
+                        >
+                          {selectedWorkerForAdvance
+                            ? (() => {
+                                const worker = workers.find(w => w.user_id === selectedWorkerForAdvance);
+                                const totalAdv = totalAdvancesByWorker[selectedWorkerForAdvance] || 0;
+                                const payroll = payrollInfo.find(p => p.worker_id === selectedWorkerForAdvance);
+                                return `${worker?.user_name} (سلف: ${totalAdv.toFixed(0)} | مكتسب: ${payroll?.earned.toFixed(0) || 0})`;
+                              })()
+                            : "اختر موظفاً"
+                          }
+                          <ChevronDown className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-full p-0">
+                        <Command>
+                          <CommandInput placeholder="ابحث عن موظف..." />
+                          <CommandEmpty>لا يوجد موظف بهذا الاسم</CommandEmpty>
+                          <CommandGroup>
+                            {workers.map((worker) => {
+                              const payroll = payrollInfo.find(p => p.worker_id === worker.user_id);
+                              const totalAdv = totalAdvancesByWorker[worker.user_id] || 0;
+                              return (
+                                <CommandItem
+                                  key={worker.user_id}
+                                  value={worker.user_name}
+                                  onSelect={() => {
+                                    setSelectedWorkerForAdvance(worker.user_id);
+                                    setOpenAdvanceCombo(false);
+                                  }}
+                                  className={payroll?.isOverdrawn ? "text-red-600" : ""}
+                                >
+                                  <div className="flex flex-col w-full">
+                                    <span>{worker.user_name}</span>
+                                    <span className="text-xs text-muted-foreground">
+                                      سلف: {totalAdv.toFixed(0)} | مكتسب: {payroll?.earned.toFixed(0) || 0}
+                                      {payroll?.isOverdrawn && " ⚠️"}
+                                    </span>
+                                  </div>
+                                </CommandItem>
+                              );
+                            })}
+                          </CommandGroup>
+                        </Command>
+                      </PopoverContent>
+                    </Popover>
                   </div>
 
                   <div>
@@ -903,7 +1265,7 @@ const Index = () => {
                   <Button 
                     onClick={handleSaveAdvance} 
                     className="w-full"
-                    disabled={!selectedWorkerForAdvance || !advanceAmount || workers.length === 0}
+                    disabled={!selectedWorkerForAdvance || !advanceAmount}
                   >
                     <Banknote className="w-4 h-4 ml-2" />
                     حفظ السلفة
@@ -914,7 +1276,7 @@ const Index = () => {
               <Card className="p-6">
                 <div className="flex justify-between items-center mb-4">
                   <h2 className="text-xl font-semibold">سجل السلف</h2>
-                  <Button variant="ghost" size="icon" onClick={fetchAdvances} title="تحديث">
+                  <Button variant="ghost" size="icon" onClick={fetchAdvances}>
                     <RefreshCw className="w-4 h-4" />
                   </Button>
                 </div>
@@ -961,14 +1323,27 @@ const Index = () => {
                               {new Date(advance.created_at).toLocaleTimeString('ar-EG')}
                             </div>
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => setAdvanceToDelete(advance.id)}
-                            className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-700"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </Button>
+                          <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => {
+                                setAdvanceToEdit(advance);
+                                setEditAdvanceAmount(advance.amount.toString());
+                              }}
+                              className="text-blue-500 hover:text-blue-700"
+                            >
+                              <Edit className="w-4 h-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => setAdvanceToDelete(advance.id)}
+                              className="text-red-500 hover:text-red-700"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
+                          </div>
                         </div>
                       ))}
                       {filteredAdvances.length > 0 && (
@@ -990,6 +1365,162 @@ const Index = () => {
         </Tabs>
 
       </div>
+
+      {/* Manual Entry Dialog */}
+      <Dialog open={showManualEntry} onOpenChange={setShowManualEntry}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>تسجيل حضور/انصراف يدوي</DialogTitle>
+            <DialogDescription>
+              استخدم هذا النموذج لتسجيل حضور أو انصراف يدوياً عندما لا يتمكن الموظف من المسح
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label>اختيار الموظف</Label>
+              <Popover open={openManualCombo} onOpenChange={setOpenManualCombo}>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" className="w-full justify-between mt-2">
+                    {manualWorker
+                      ? workers.find(w => w.user_id === manualWorker)?.user_name
+                      : "اختر موظفاً"
+                    }
+                    <ChevronDown className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-full p-0">
+                  <Command>
+                    <CommandInput placeholder="ابحث عن موظف..." />
+                    <CommandEmpty>لا يوجد موظف بهذا الاسم</CommandEmpty>
+                    <CommandGroup>
+                      {workers.map((worker) => (
+                        <CommandItem
+                          key={worker.user_id}
+                          value={worker.user_name}
+                          onSelect={() => {
+                            setManualWorker(worker.user_id);
+                            setOpenManualCombo(false);
+                          }}
+                        >
+                          {worker.user_name}
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            </div>
+            <div>
+              <Label htmlFor="manual-date">التاريخ</Label>
+              <Input
+                id="manual-date"
+                type="date"
+                value={manualDate}
+                onChange={(e) => setManualDate(e.target.value)}
+                className="mt-2"
+              />
+            </div>
+            <div>
+              <Label htmlFor="manual-time">الوقت</Label>
+              <Input
+                id="manual-time"
+                type="time"
+                value={manualTime}
+                onChange={(e) => setManualTime(e.target.value)}
+                className="mt-2"
+              />
+            </div>
+            <div>
+              <Label>النوع</Label>
+              <Select value={manualType} onValueChange={(v: "حضور" | "انصراف") => setManualType(v)}>
+                <SelectTrigger className="mt-2">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="حضور">حضور</SelectItem>
+                  <SelectItem value="انصراف">انصراف</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowManualEntry(false)}>
+              إلغاء
+            </Button>
+            <Button onClick={handleManualEntry}>
+              تسجيل
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Advance Dialog */}
+      <Dialog open={!!advanceToEdit} onOpenChange={() => setAdvanceToEdit(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>تعديل السلفة</DialogTitle>
+            <DialogDescription>
+              تعديل قيمة السلفة لـ {advanceToEdit?.user_name}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="edit-amount">المبلغ الجديد (جنيه)</Label>
+              <Input
+                id="edit-amount"
+                type="number"
+                value={editAdvanceAmount}
+                onChange={(e) => setEditAdvanceAmount(e.target.value)}
+                className="mt-2"
+                min="0"
+                step="0.01"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAdvanceToEdit(null)}>
+              إلغاء
+            </Button>
+            <Button onClick={handleEditAdvance}>
+              حفظ التعديلات
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Hourly Rate Dialog */}
+      <Dialog open={showRateDialog} onOpenChange={setShowRateDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>تعديل سعر الساعة</DialogTitle>
+            <DialogDescription>
+              سعر الساعة الحالي: {hourlyRate} جنيه
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label htmlFor="hourly-rate">سعر الساعة (جنيه)</Label>
+              <Input
+                id="hourly-rate"
+                type="number"
+                value={tempHourlyRate}
+                onChange={(e) => setTempHourlyRate(e.target.value)}
+                className="mt-2"
+                min="0"
+                step="0.01"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowRateDialog(false)}>
+              إلغاء
+            </Button>
+            <Button onClick={handleSaveHourlyRate}>
+              حفظ
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete Advance Dialog */}
       <AlertDialog open={!!advanceToDelete} onOpenChange={() => setAdvanceToDelete(null)}>
